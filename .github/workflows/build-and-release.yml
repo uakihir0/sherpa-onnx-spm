@@ -1,0 +1,247 @@
+name: Build and Release XCFrameworks
+
+on:
+  schedule:
+    # Check for new versions every Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      sherpa_onnx_version:
+        description: 'Target version to build (e.g. 1.12.38). Leave empty for latest release.'
+        required: false
+        type: string
+      force_rebuild:
+        description: 'Force rebuild even if the version is already published'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  # ============================================================
+  # Job 1: Check for new version
+  # ============================================================
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      update_needed: ${{ steps.check.outputs.update_needed }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for new sherpa-onnx release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get current published version
+          CURRENT=$(cat versions/current-version.txt 2>/dev/null || echo "0.0.0")
+          echo "Current version: $CURRENT"
+
+          # Determine target version
+          if [[ -n "${{ inputs.sherpa_onnx_version }}" ]]; then
+            TARGET="${{ inputs.sherpa_onnx_version }}"
+            echo "Manual version specified: $TARGET"
+          else
+            TARGET=$(gh api repos/k2-fsa/sherpa-onnx/releases/latest --jq '.tag_name' | sed 's/^v//')
+            echo "Latest release: $TARGET"
+          fi
+
+          # Check if update is needed
+          if [[ "$CURRENT" != "$TARGET" ]] || [[ "${{ inputs.force_rebuild }}" == "true" ]]; then
+            echo "update_needed=true" >> "$GITHUB_OUTPUT"
+            echo "version=$TARGET" >> "$GITHUB_OUTPUT"
+            echo "Update needed: $CURRENT -> $TARGET"
+          else
+            echo "update_needed=false" >> "$GITHUB_OUTPUT"
+            echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+            echo "Already up to date: $CURRENT"
+          fi
+
+  # ============================================================
+  # Job 2: Build XCFrameworks
+  # ============================================================
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.update_needed == 'true'
+    runs-on: macos-14
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install cmake wget
+
+      - name: Clone sherpa-onnx
+        run: |
+          git clone --depth 1 --branch "v${VERSION}" https://github.com/k2-fsa/sherpa-onnx.git /tmp/sherpa-onnx
+
+      - name: Build iOS XCFrameworks
+        run: |
+          cd /tmp/sherpa-onnx
+          export CMAKE_VERBOSE_MAKEFILE=ON
+          bash build-ios.sh
+
+      - name: Inject modulemap into sherpa-onnx.xcframework
+        run: |
+          XCFW_DIR="/tmp/sherpa-onnx/build-ios/sherpa-onnx.xcframework"
+          for slice_dir in "$XCFW_DIR"/*/; do
+            headers_dir="${slice_dir}Headers"
+            if [[ -d "$headers_dir" ]]; then
+              cat > "${headers_dir}/module.modulemap" << 'MODULEMAP'
+          module sherpa_onnx {
+              header "sherpa-onnx/c-api/c-api.h"
+              export *
+          }
+          MODULEMAP
+              echo "Injected modulemap into: ${headers_dir}"
+            fi
+          done
+
+      - name: Inject modulemap into onnxruntime.xcframework
+        run: |
+          ONNX_XCFW_DIR="/tmp/sherpa-onnx/build-ios/ios-onnxruntime/onnxruntime.xcframework"
+
+          # Top-level shared Headers directory
+          ONNX_HEADERS_DIR="${ONNX_XCFW_DIR}/Headers"
+          if [[ -d "$ONNX_HEADERS_DIR" && ! -f "${ONNX_HEADERS_DIR}/module.modulemap" ]]; then
+            cat > "${ONNX_HEADERS_DIR}/module.modulemap" << 'MODULEMAP'
+          module onnxruntime {
+              header "onnxruntime_c_api.h"
+              export *
+          }
+          MODULEMAP
+            echo "Injected modulemap into: ${ONNX_HEADERS_DIR}"
+          fi
+
+          # Per-platform slice Headers directories
+          for slice_dir in "$ONNX_XCFW_DIR"/*/; do
+            slice_name="$(basename "$slice_dir")"
+            if [[ "$slice_name" != "Headers" && -d "${slice_dir}Headers" ]]; then
+              if [[ ! -f "${slice_dir}Headers/module.modulemap" ]]; then
+                cat > "${slice_dir}Headers/module.modulemap" << 'MODULEMAP'
+          module onnxruntime {
+              header "onnxruntime_c_api.h"
+              export *
+          }
+          MODULEMAP
+                echo "Injected modulemap into: ${slice_dir}Headers"
+              fi
+            fi
+          done
+
+      - name: Package sherpa-onnx.xcframework
+        run: |
+          cd /tmp/sherpa-onnx/build-ios
+          zip -ry sherpa-onnx.xcframework.zip sherpa-onnx.xcframework/
+          echo "CHECKSUM_SHERPA=$(swift package compute-checksum sherpa-onnx.xcframework.zip)" >> "$GITHUB_ENV"
+
+      - name: Package onnxruntime.xcframework
+        run: |
+          cd /tmp/sherpa-onnx/build-ios/ios-onnxruntime
+          zip -ry onnxruntime.xcframework.zip onnxruntime.xcframework/
+          echo "CHECKSUM_ONNXRUNTIME=$(swift package compute-checksum onnxruntime.xcframework.zip)" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcframeworks
+          path: |
+            /tmp/sherpa-onnx/build-ios/sherpa-onnx.xcframework.zip
+            /tmp/sherpa-onnx/build-ios/ios-onnxruntime/onnxruntime.xcframework.zip
+          retention-days: 1
+
+      - name: Save checksums
+        run: |
+          echo "$CHECKSUM_SHERPA" > /tmp/checksum-sherpa.txt
+          echo "$CHECKSUM_ONNXRUNTIME" > /tmp/checksum-onnxruntime.txt
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: |
+            /tmp/checksum-sherpa.txt
+            /tmp/checksum-onnxruntime.txt
+          retention-days: 1
+
+  # ============================================================
+  # Job 3: Create GitHub Release and update Package.swift
+  # ============================================================
+  release:
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: xcframeworks
+          path: /tmp/xcframeworks
+
+      - name: Download checksums
+        uses: actions/download-artifact@v4
+        with:
+          name: checksums
+          path: /tmp/checksums
+
+      - name: Read checksums
+        id: checksums
+        run: |
+          CHECKSUM_SHERPA=$(cat /tmp/checksums/checksum-sherpa.txt)
+          CHECKSUM_ONNXRUNTIME=$(cat /tmp/checksums/checksum-onnxruntime.txt)
+          echo "sherpa=$CHECKSUM_SHERPA" >> "$GITHUB_OUTPUT"
+          echo "onnxruntime=$CHECKSUM_ONNXRUNTIME" >> "$GITHUB_OUTPUT"
+          echo "Checksum (sherpa-onnx): $CHECKSUM_SHERPA"
+          echo "Checksum (onnxruntime): $CHECKSUM_ONNXRUNTIME"
+
+      - name: Create GitHub Release
+        run: |
+          # Delete existing release if present
+          gh release delete "${VERSION}" --yes 2>/dev/null || true
+          git push origin --delete "${VERSION}" 2>/dev/null || true
+
+          # Find xcframework zip files
+          SHERPA_ZIP=$(find /tmp/xcframeworks -name "sherpa-onnx.xcframework.zip" | head -1)
+          ONNX_ZIP=$(find /tmp/xcframeworks -name "onnxruntime.xcframework.zip" | head -1)
+
+          gh release create "${VERSION}" \
+            --title "sherpa-onnx v${VERSION}" \
+            --notes "Pre-built iOS XCFrameworks for sherpa-onnx v${VERSION}
+
+          ## Checksums (SHA-256)
+          - \`sherpa-onnx.xcframework.zip\`: \`${{ steps.checksums.outputs.sherpa }}\`
+          - \`onnxruntime.xcframework.zip\`: \`${{ steps.checksums.outputs.onnxruntime }}\`
+          " \
+            "$SHERPA_ZIP" \
+            "$ONNX_ZIP"
+
+      - name: Update Package.swift
+        run: |
+          CHECKSUM_SHERPA="${{ steps.checksums.outputs.sherpa }}"
+          CHECKSUM_ONNXRUNTIME="${{ steps.checksums.outputs.onnxruntime }}"
+
+          sed -i "s|^let version = \".*\"|let version = \"${VERSION}\"|" Package.swift
+          sed -i "s|^let checksumSherpaOnnx = \".*\"|let checksumSherpaOnnx = \"${CHECKSUM_SHERPA}\"|" Package.swift
+          sed -i "s|^let checksumOnnxRuntime = \".*\"|let checksumOnnxRuntime = \"${CHECKSUM_ONNXRUNTIME}\"|" Package.swift
+
+          echo "${VERSION}" > versions/current-version.txt
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Package.swift versions/current-version.txt
+          git commit -m "Update to sherpa-onnx v${VERSION}"
+          git push
