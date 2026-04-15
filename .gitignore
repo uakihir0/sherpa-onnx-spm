@@ -1,0 +1,9 @@
+.DS_Store
+.build/
+*.xcframework/
+*.xcframework.zip
+.swiftpm/
+Packages/
+xcuserdata/
+DerivedData/
+.kiro/
