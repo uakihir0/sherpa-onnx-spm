@@ -144,8 +144,11 @@ jobs:
 
       - name: Package onnxruntime.xcframework
         run: |
-          cd /tmp/sherpa-onnx/build-ios/ios-onnxruntime
-          zip -ry onnxruntime.xcframework.zip onnxruntime.xcframework/
+          # The onnxruntime.xcframework in ios-onnxruntime/ is a symlink.
+          # Copy with dereference to avoid zip symlink issues.
+          cp -RL /tmp/sherpa-onnx/build-ios/ios-onnxruntime/onnxruntime.xcframework /tmp/onnxruntime.xcframework
+          cd /tmp
+          zip -r onnxruntime.xcframework.zip onnxruntime.xcframework/
           echo "CHECKSUM_ONNXRUNTIME=$(swift package compute-checksum onnxruntime.xcframework.zip)" >> "$GITHUB_ENV"
 
       - name: Upload artifacts
@@ -154,7 +157,7 @@ jobs:
           name: xcframeworks
           path: |
             /tmp/sherpa-onnx/build-ios/sherpa-onnx.xcframework.zip
-            /tmp/sherpa-onnx/build-ios/ios-onnxruntime/onnxruntime.xcframework.zip
+            /tmp/onnxruntime.xcframework.zip
           retention-days: 1
 
       - name: Save checksums
