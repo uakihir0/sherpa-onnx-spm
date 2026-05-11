@@ -2,9 +2,9 @@
 
 import PackageDescription
 
-let version = "1.13.0"
-let checksumSherpaOnnx = "39ec223df7f1dd7982c9741f6541d027d80e81c65a3409c15b25c445c264621c"
-let checksumOnnxRuntime = "738689591fa0811c3e78942504a0b25f24b7543ba593b52dc461d3ecf4f6a086"
+let version = "1.13.1"
+let checksumSherpaOnnx = "41827df0c4e357c1bfc7be19eebccb95df4fcdd940527b5091b59f41a90c3a5a"
+let checksumOnnxRuntime = "75d0d9197e38ab0eabac948aac68b6b3b3ddfd4c4706538070ba6bb22e490a51"
 
 let package = Package(
     name: "SherpaOnnx",
